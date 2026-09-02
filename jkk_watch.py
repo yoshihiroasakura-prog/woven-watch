@@ -110,35 +110,32 @@ def body_text(page) -> str:
 
 
 def try_advance(page) -> str:
-    """中継ページから先へ進むための手を順に試す。"""
-    # 1. フォームがあれば submit
-    result = page.evaluate(
-        """() => {
-            if (document.forms.length > 0) {
-                try {
-                    document.forms[0].submit();
-                    return 'form.submit() 実行 (forms=' + document.forms.length + ')';
-                } catch (e) {
-                    return 'form.submit() 失敗: ' + e.message;
-                }
-            }
-            return null;
-        }"""
-    )
-    if result:
-        return result
+    """中継ページの forwardForm を同一ウィンドウ宛に送信して先へ進む。
 
-    # 2. onclick付きリンクをクリック
-    result = page.evaluate(
-        """() => {
-            const as = Array.from(document.querySelectorAll('a'));
-            const a = as.find(x => x.onclick || x.getAttribute('onclick'));
-            if (a) { a.click(); return 'onclick付きリンクをクリック'; }
-            if (as.length > 0) { as[0].click(); return '先頭リンクをクリック'; }
-            return 'リンク・フォームなし';
-        }"""
-    )
-    return result or "手立てなし"
+    JKKの中継ページは window.open した別ウィンドウ宛にPOSTする作りなので、
+    target を _self に付け替えてから送信する。
+    """
+    try:
+        return page.evaluate(
+            """() => {
+                const f = document.forwardForm || document.forms[0];
+                if (!f) return 'フォームなし';
+                try {
+                    let nextURL = null;
+                    if (f.url && f.url.value) {
+                        nextURL = f.url.value;
+                        f.action = nextURL;
+                    }
+                    f.target = '_self';
+                    f.submit();
+                    return 'forwardForm を同一ウィンドウへ送信: ' + (nextURL || f.action);
+                } catch (e) {
+                    return '送信失敗: ' + e.message;
+                }
+            }"""
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"遷移中のため評価できず ({type(exc).__name__})"
 
 
 def dump_diagnostics(page) -> None:
@@ -191,6 +188,20 @@ def fetch_text(page) -> tuple[str, bool]:
             page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:  # noqa: BLE001
             pass
+
+        # 別ウィンドウが開いてしまった場合はそちらを確認する
+        for other in page.context.pages:
+            if other is page:
+                continue
+            try:
+                other_raw = other.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                ) or ""
+                if reached_result(other_raw) and not is_interstitial(other_raw):
+                    print("[ok] 別ウィンドウ側で結果ページを検出", flush=True)
+                    return normalize(other_raw), True
+            except Exception:  # noqa: BLE001
+                pass
 
     raw = body_text(page)
     if reached_result(raw) and not is_interstitial(raw):
