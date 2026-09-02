@@ -7,8 +7,8 @@ Woven City 予約情報 監視スクリプト
 
 設計方針（2026-09 の誤検知を受けて改訂）:
   このサイトはJavaScript描画のため、実行のたびに取得できる行数が揺れる。
-  特にクッキー同意バナーが出たり消えたりして誤検知の原因になったため、
-  比較前に除去する。
+  特にクッキー同意バナーとプライバシー設定パネルが出たり消えたりして
+  誤検知の原因になったため、比較前に除去する。
   また「行が減っただけ」の変化は取得漏れの疑いが濃く、告知ではない。
   9月下旬の告知は必ず文章が増える形で来るので、
     ・追加行があるとき
@@ -99,6 +99,13 @@ NOISE_PATTERNS = [
     re.compile(r"^Reject all$", re.I),
     re.compile(r"^クッキー", re.I),
     re.compile(r"すべて(受け入れる|拒否)"),
+    # カリフォルニア州向けプライバシー設定パネル（woven.toyota で確認）
+    re.compile(r"Manage Your Personal Information", re.I),
+    re.compile(r"Do Not Sell or Share My Personal Information", re.I),
+    re.compile(r"You may opt out of the sale or sharing", re.I),
+    re.compile(r"Requests to Opt Out", re.I),
+    re.compile(r"^OK$"),
+    re.compile(r"^Do not sell or share my personal information$", re.I),
 ]
 
 JST = timezone(timedelta(hours=9))
