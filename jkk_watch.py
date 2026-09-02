@@ -2,17 +2,23 @@
 """
 JKK東京 コーシャハイム方南町ガーデンコート あき家監視スクリプト
 
-物件専用の直リンク（akiyaJyokenDirect）を開き、
-あき家検索結果ページの内容を前回実行時と比較する。
+物件専用の直リンクを開き、あき家の有無だけを判定する。
 
-重要な設計方針:
-  結果ページに到達したと確認できない限り、あき家の有無を判定しない。
-  取得失敗を「あき家あり」と誤って扱わないため。
+実際のページ挙動（2026-09 時点で確認）:
+  空室ゼロのときは検索結果一覧ではなく、検索条件画面に
+  「ご希望の住宅、またはご希望の条件の空室はございませんでした。」
+  というメッセージ付きで戻される。
+  この画面には区名・沿線名が大量に並ぶため、本文全体の差分監視は
+  ノイズにしかならない。よって判定結果の変化だけを通知条件とする。
+
+判定は3値:
+  none    空室なし（定常状態）
+  some    空室あり  → 通知
+  unknown 判別できない → エラー終了（勝手に「あり」にしない）
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import sys
@@ -36,34 +42,33 @@ TARGET_URL = (
 STATE_FILE = Path("state-jkk/honancho.json")
 ALERT_FILE = Path("ALERT_JKK.md")
 
-# 「あき家なし」を示す語
+# 「空室なし」を示す文言（実ページで確認済み）
 NO_VACANCY_HINTS = [
-    "該当する住宅はありません",
-    "該当する住戸はありません",
-    "該当がありません",
-    "見つかりませんでした",
-    "ありませんでした",
+    "空室はございませんでした",
+    "ございませんでした",
 ]
 
-# 「0件」は「10件」に部分一致するため正規表現で判定
-NO_VACANCY_PATTERNS = [re.compile(r"(?<!\d)0\s*件")]
+# 「空室あり」を示す語（結果一覧に物件名が出る）
+VACANCY_MARKER = "コーシャハイム"
+
+# 検索システムのページに到達したことを示す語
+PAGE_MARKERS = ["先着順募集", "条件から検索", "エリアで検索", "住宅名"]
 
 # 中継ページを示す語
 REDIRECT_HINTS = ["自動で次の画面", "しばらくたっても"]
 
-# 結果ページに到達したことを示す語。どれも無ければ取得失敗とみなす。
-RESULT_MARKERS = ["コーシャハイム", "検索結果", "あき家", "空家", "住宅名", "間取"]
+# 通知本文に載せる意味のある行だけを拾うための除外パターン
+NOISE_PATTERNS = [
+    re.compile(r"^[ぁ-んァ-ヶ一-龥Ａ-ＺA-Za-z\s]{0,4}(線|区|市|町|村)$"),
+    re.compile(r"^(ＪＲ|JR|東武|京成|西武|小田急|京王|東急|東京メトロ|都営|京急|相鉄|多摩|埼玉|北総|新交通|ゆりかもめ)"),
+    re.compile(r"^[^\s]+(区|市|町|村)(\s+[^\s]+(区|市|町|村))+$"),
+]
 
-MIN_TEXT_LEN = 40
-MAX_DIFF_LINES = 40
-LOG_PREVIEW_LINES = 60
 MAX_ATTEMPTS = 6
-
+LOG_PREVIEW_LINES = 40
 JST = timezone(timedelta(hours=9))
 
 
-# ---------------------------------------------------------------------------
-# テキスト処理
 # ---------------------------------------------------------------------------
 
 def normalize(text: str) -> str:
@@ -78,31 +83,35 @@ def normalize(text: str) -> str:
     return "\n".join(lines)
 
 
-def text_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-
-def line_diff(old: str, new: str) -> list[str]:
-    old_lines = set(old.splitlines())
-    return [ln for ln in new.splitlines() if ln not in old_lines]
-
-
-def looks_no_vacancy(text: str) -> bool:
-    if any(h in text for h in NO_VACANCY_HINTS):
-        return True
-    return any(p.search(text) for p in NO_VACANCY_PATTERNS)
+def signal_lines(text: str) -> list[str]:
+    """区名・沿線名の羅列を除いた、意味のある行だけを返す。"""
+    out = []
+    for line in text.splitlines():
+        if any(p.match(line) for p in NOISE_PATTERNS):
+            continue
+        out.append(line)
+    return out
 
 
 def is_interstitial(text: str) -> bool:
     return any(h in text for h in REDIRECT_HINTS)
 
 
-def reached_result(text: str) -> bool:
-    return any(m in text for m in RESULT_MARKERS)
+def on_search_system(text: str) -> bool:
+    return any(m in text for m in PAGE_MARKERS)
 
 
-# ---------------------------------------------------------------------------
-# 取得
+def judge(text: str) -> str:
+    """none / some / unknown を返す。"""
+    if any(h in text for h in NO_VACANCY_HINTS):
+        return "none"
+    if VACANCY_MARKER in text:
+        return "some"
+    if on_search_system(text):
+        return "unknown"
+    return "unknown"
+
+
 # ---------------------------------------------------------------------------
 
 def body_text(page) -> str:
@@ -110,11 +119,6 @@ def body_text(page) -> str:
 
 
 def try_advance(page) -> str:
-    """中継ページの forwardForm を同一ウィンドウ宛に送信して先へ進む。
-
-    JKKの中継ページは window.open した別ウィンドウ宛にPOSTする作りなので、
-    target を _self に付け替えてから送信する。
-    """
     try:
         return page.evaluate(
             """() => {
@@ -128,7 +132,7 @@ def try_advance(page) -> str:
                     }
                     f.target = '_self';
                     f.submit();
-                    return 'forwardForm を同一ウィンドウへ送信: ' + (nextURL || f.action);
+                    return 'forwardForm を同一ウィンドウへ送信';
                 } catch (e) {
                     return '送信失敗: ' + e.message;
                 }
@@ -138,47 +142,19 @@ def try_advance(page) -> str:
         return f"遷移中のため評価できず ({type(exc).__name__})"
 
 
-def dump_diagnostics(page) -> None:
-    """到達できなかったときに構造を吐き出す。"""
-    print("---- 診断情報 ----", flush=True)
-    print(f"  URL: {page.url}", flush=True)
-    try:
-        info = page.evaluate(
-            """() => {
-                const forms = Array.from(document.forms).map(f => ({
-                    name: f.name, action: f.action, method: f.method,
-                    fields: Array.from(f.elements).map(e => e.name).filter(Boolean)
-                }));
-                const links = Array.from(document.querySelectorAll('a'))
-                    .slice(0, 10)
-                    .map(a => ({ text: (a.innerText || '').trim().slice(0, 30),
-                                 href: a.getAttribute('href'),
-                                 onclick: a.getAttribute('onclick') }));
-                const scripts = Array.from(document.querySelectorAll('script'))
-                    .map(s => (s.innerText || '').trim().slice(0, 300))
-                    .filter(Boolean).slice(0, 3);
-                return { forms, links, scripts };
-            }"""
-        )
-        print("  forms: " + json.dumps(info["forms"], ensure_ascii=False), flush=True)
-        print("  links: " + json.dumps(info["links"], ensure_ascii=False), flush=True)
-        for i, s in enumerate(info["scripts"]):
-            print(f"  script[{i}]: {s}", flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  診断取得失敗: {exc}", flush=True)
-    print("---- 診断ここまで ----", flush=True)
+def usable(raw: str) -> bool:
+    return on_search_system(raw) and not is_interstitial(raw)
 
 
 def fetch_text(page) -> tuple[str, bool]:
-    """(正規化済み本文, 結果ページに到達したか) を返す。"""
     page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         page.wait_for_timeout(2500)
-        raw = body_text(page)
 
-        if reached_result(raw) and not is_interstitial(raw):
-            print(f"[ok] 結果ページに到達 (試行 {attempt})", flush=True)
+        raw = body_text(page)
+        if usable(raw):
+            print(f"[ok] 検索システムに到達 (試行 {attempt})", flush=True)
             return normalize(raw), True
 
         action = try_advance(page)
@@ -189,7 +165,6 @@ def fetch_text(page) -> tuple[str, bool]:
         except Exception:  # noqa: BLE001
             pass
 
-        # 別ウィンドウが開いてしまった場合はそちらを確認する
         for other in page.context.pages:
             if other is page:
                 continue
@@ -197,58 +172,51 @@ def fetch_text(page) -> tuple[str, bool]:
                 other_raw = other.evaluate(
                     "() => document.body ? document.body.innerText : ''"
                 ) or ""
-                if reached_result(other_raw) and not is_interstitial(other_raw):
-                    print("[ok] 別ウィンドウ側で結果ページを検出", flush=True)
+                if usable(other_raw):
+                    print("[ok] 別ウィンドウ側で検索システムを検出", flush=True)
                     return normalize(other_raw), True
             except Exception:  # noqa: BLE001
                 pass
 
     raw = body_text(page)
-    if reached_result(raw) and not is_interstitial(raw):
+    if usable(raw):
         return normalize(raw), True
 
-    dump_diagnostics(page)
+    print("---- 到達できなかったページの冒頭 ----", flush=True)
+    for ln in normalize(raw).splitlines()[:20]:
+        print("  " + ln, flush=True)
+    print("---- ここまで ----", flush=True)
     return normalize(raw), False
 
 
 # ---------------------------------------------------------------------------
 
-def build_alert(reasons: list[str], added: list[str], vacancy: bool, text: str) -> str:
+def build_alert(verdict: str, prev_verdict: str | None, lines: list[str]) -> str:
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
     out = [f"## {BUKKEN_NAME}", "", f"検知時刻: {now}", ""]
 
-    if vacancy:
-        out.append("**あき家あり と判定されました。**")
+    if verdict == "some":
+        out.append("# あき家が出ました")
         out.append("")
-        out.append("先着順です。すぐにJKKねっとで確認・申込みしてください。")
+        out.append("**先着順です。申込みが入り次第、受付は終了します。**")
+        out.append("")
+        out.append(f"[JKKねっとであき家検索を開く]({TARGET_URL})")
     else:
-        out.append("ページ内容が変化しました（あき家なしと判定）。")
-    out.append("")
-    out.append(f"[あき家検索を開く]({TARGET_URL})")
-    out.append("")
-
-    for r in reasons:
-        out.append(f"- {r}")
-    out.append("")
-
-    if added:
-        out.append("**追加された行**")
+        label = {"none": "空室なし", "unknown": "判別不能"}[verdict]
+        out.append(f"判定が「{label}」に変化しました。")
         out.append("")
-        out.append("```")
-        for ln in added[:MAX_DIFF_LINES]:
-            out.append(ln)
-        if len(added) > MAX_DIFF_LINES:
-            out.append(f"... 他 {len(added) - MAX_DIFF_LINES} 行")
-        out.append("```")
-        out.append("")
+        out.append(f"[あき家検索を開く]({TARGET_URL})")
 
-    out.append("<details><summary>取得した全文</summary>")
+    out.append("")
+    out.append(f"- 前回: {prev_verdict or '（記録なし）'}")
+    out.append(f"- 今回: {verdict}")
+    out.append("")
+    out.append("**ページから読み取った内容**")
     out.append("")
     out.append("```")
-    out.append(text[:4000])
+    for ln in lines[:25]:
+        out.append(ln)
     out.append("```")
-    out.append("")
-    out.append("</details>")
     return "\n".join(out)
 
 
@@ -276,55 +244,34 @@ def main() -> int:
             return 1
         browser.close()
 
-    print(f"---- 取得した本文（先頭 {LOG_PREVIEW_LINES} 行）----", flush=True)
-    for ln in text.splitlines()[:LOG_PREVIEW_LINES]:
+    if not ok:
+        print("[ERROR] 検索システムに到達できませんでした。判定は行いません。", flush=True)
+        return 1
+
+    lines = signal_lines(text)
+
+    print(f"---- 読み取った内容（ノイズ除去後 先頭 {LOG_PREVIEW_LINES} 行）----", flush=True)
+    for ln in lines[:LOG_PREVIEW_LINES]:
         print("  " + ln, flush=True)
     print("---- ここまで ----", flush=True)
 
-    # 結果ページに到達できていないなら、あき家の有無は判定しない
-    if not ok:
-        print("[ERROR] 結果ページに到達できませんでした。判定は行いません。", flush=True)
-        return 1
+    verdict = judge(text)
+    print(f"[判定] {verdict}", flush=True)
 
-    if len(text) < MIN_TEXT_LEN:
-        print(f"[ERROR] 本文が{len(text)}文字しか取得できませんでした", flush=True)
-        return 1
-
-    vacancy = not looks_no_vacancy(text)
-    print(f"[判定] あき家: {'あり' if vacancy else 'なし'}", flush=True)
-
-    reasons: list[str] = []
-    added: list[str] = []
-    changed = False
-
+    prev_verdict = None
     if STATE_FILE.exists():
-        prev = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        prev_text = prev.get("text", "")
-        prev_vacancy = prev.get("vacancy")
-
-        if prev_vacancy is not None and prev_vacancy != vacancy:
-            changed = True
-            reasons.append(
-                f"あき家判定が変化: {'あり' if prev_vacancy else 'なし'}"
-                f" → {'あり' if vacancy else 'なし'}"
-            )
-
-        if text_hash(prev_text) != text_hash(text):
-            added = line_diff(prev_text, text)
-            removed = line_diff(text, prev_text)
-            changed = True
-            reasons.append(f"本文変化: 追加{len(added)}行 / 削除{len(removed)}行")
-    else:
-        reasons.append("初回取得（基準を保存）")
+        try:
+            prev_verdict = json.loads(STATE_FILE.read_text(encoding="utf-8")).get("verdict")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] 前回状態を読めませんでした: {exc}", flush=True)
 
     STATE_FILE.write_text(
         json.dumps(
             {
                 "url": TARGET_URL,
                 "fetched_at": datetime.now(JST).isoformat(),
-                "hash": text_hash(text),
-                "vacancy": vacancy,
-                "text": text,
+                "verdict": verdict,
+                "lines": lines[:40],
             },
             ensure_ascii=False,
             indent=1,
@@ -332,11 +279,20 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    if changed:
-        ALERT_FILE.write_text(build_alert(reasons, added, vacancy, text), encoding="utf-8")
-        print("[alert] 通知対象あり", flush=True)
+    if verdict == "unknown":
+        print("[ERROR] 空室の有無を判別できませんでした。文言が変わった可能性があります。",
+              flush=True)
+        return 1
+
+    if prev_verdict is None:
+        print("[alert] 初回のため通知しません", flush=True)
+        return 0
+
+    if verdict != prev_verdict:
+        ALERT_FILE.write_text(build_alert(verdict, prev_verdict, lines), encoding="utf-8")
+        print(f"[alert] 判定変化 {prev_verdict} → {verdict}", flush=True)
     else:
-        print("[alert] なし", flush=True)
+        print("[alert] なし（変化なし）", flush=True)
 
     return 0
 
