@@ -1,0 +1,72 @@
+name: jkk-honancho-watch
+
+on:
+  schedule:
+    # 日本時間 月〜土 9:30〜17:00 のみ 5分間隔（cronはUTC指定）
+    # JST 9:30-9:55
+    - cron: "30-55/5 0 * * 1-6"
+    # JST 10:00-16:55
+    - cron: "*/5 1-7 * * 1-6"
+    # JST 17:00
+    - cron: "0 8 * * 1-6"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: jkk-honancho-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-v1
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet playwright
+          playwright install --with-deps chromium
+
+      - name: Run watcher
+        run: python jkk_watch.py
+
+      - name: Create issue on change
+        if: hashFiles('ALERT_JKK.md') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "方南町 空室情報に変化 $(TZ=Asia/Tokyo date '+%m/%d %H:%M')" \
+            --body-file ALERT_JKK.md
+
+      - name: Commit state
+        run: |
+          rm -f ALERT_JKK.md
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state-jkk/
+          if git diff --staged --quiet; then
+            echo "no state change"
+          else
+            git commit -m "jkk state: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+            for i in 1 2 3; do
+              git pull --rebase --autostash && git push && break
+              echo "retry push ($i)"
+              sleep 5
+            done
+          fi
