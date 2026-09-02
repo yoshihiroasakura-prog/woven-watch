@@ -5,8 +5,9 @@ JKK東京 コーシャハイム方南町ガーデンコート あき家監視ス
 物件専用の直リンク（akiyaJyokenDirect）を開き、
 あき家検索結果ページの内容を前回実行時と比較する。
 
-変化があれば ALERT_JKK.md を書き出す。
-GitHub Actions 側は ALERT_JKK.md の有無で通知の要否を判断する。
+重要な設計方針:
+  結果ページに到達したと確認できない限り、あき家の有無を判定しない。
+  取得失敗を「あき家あり」と誤って扱わないため。
 """
 
 from __future__ import annotations
@@ -26,8 +27,6 @@ from playwright.sync_api import sync_playwright
 
 BUKKEN_NAME = "コーシャハイム方南町ガーデンコート"
 
-# 公式サイトの物件ページに掲載されている「最新の空室状況を確認する」の直リンク。
-# jutaku_name は住宅名カナのUTF-16BE16進表記。
 TARGET_URL = (
     "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyokenDirect"
     "?sen_flg=1"
@@ -37,8 +36,7 @@ TARGET_URL = (
 STATE_FILE = Path("state-jkk/honancho.json")
 ALERT_FILE = Path("ALERT_JKK.md")
 
-# 「あき家なし」を示すと思われる語。どれか1つでも含まれれば空室なしと判定する。
-# 初回実行のログを見て実際の文言に合わせて調整すること。
+# 「あき家なし」を示す語
 NO_VACANCY_HINTS = [
     "該当する住宅はありません",
     "該当する住戸はありません",
@@ -47,17 +45,19 @@ NO_VACANCY_HINTS = [
     "ありませんでした",
 ]
 
-# 「0件」は「10件」「20件」に部分一致してしまうため正規表現で判定する
-NO_VACANCY_PATTERNS = [
-    re.compile(r"(?<!\d)0\s*件"),
-]
+# 「0件」は「10件」に部分一致するため正規表現で判定
+NO_VACANCY_PATTERNS = [re.compile(r"(?<!\d)0\s*件")]
 
-# リダイレクト中継ページを示す語
+# 中継ページを示す語
 REDIRECT_HINTS = ["自動で次の画面", "しばらくたっても"]
+
+# 結果ページに到達したことを示す語。どれも無ければ取得失敗とみなす。
+RESULT_MARKERS = ["コーシャハイム", "検索結果", "あき家", "空家", "住宅名", "間取"]
 
 MIN_TEXT_LEN = 40
 MAX_DIFF_LINES = 40
 LOG_PREVIEW_LINES = 60
+MAX_ATTEMPTS = 6
 
 JST = timezone(timedelta(hours=9))
 
@@ -67,19 +67,12 @@ JST = timezone(timedelta(hours=9))
 # ---------------------------------------------------------------------------
 
 def normalize(text: str) -> str:
-    """比較用の正規化。
-
-    日付・時刻の表示は実行のたびに変わりうるので伏せ字にする。
-    行そのものは消さない（部屋情報の行を失わないため）。
-    """
     lines = []
     for raw in text.splitlines():
         line = re.sub(r"[ \t\u3000]+", " ", raw).strip()
         if not line:
             continue
-        # 2026年9月2日 / 2026/09/02 / 2026-09-02
         line = re.sub(r"\d{4}\s*[年/-]\s*\d{1,2}\s*[月/-]\s*\d{1,2}\s*日?", "<日付>", line)
-        # 14:05 / 14時05分
         line = re.sub(r"\d{1,2}\s*[:時]\s*\d{2}\s*分?", "<時刻>", line)
         lines.append(line)
     return "\n".join(lines)
@@ -100,34 +93,111 @@ def looks_no_vacancy(text: str) -> bool:
     return any(p.search(text) for p in NO_VACANCY_PATTERNS)
 
 
+def is_interstitial(text: str) -> bool:
+    return any(h in text for h in REDIRECT_HINTS)
+
+
+def reached_result(text: str) -> bool:
+    return any(m in text for m in RESULT_MARKERS)
+
+
 # ---------------------------------------------------------------------------
 # 取得
 # ---------------------------------------------------------------------------
 
-def fetch_text(page) -> str:
-    """中継ページのリダイレクトを追ってから本文を取る。"""
-    page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+def body_text(page) -> str:
+    return page.evaluate("() => document.body ? document.body.innerText : ''") or ""
 
-    for attempt in range(4):
-        page.wait_for_timeout(3000)
-        body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
 
-        if not any(h in body for h in REDIRECT_HINTS) and len(body.strip()) >= MIN_TEXT_LEN:
-            return normalize(body)
+def try_advance(page) -> str:
+    """中継ページから先へ進むための手を順に試す。"""
+    # 1. フォームがあれば submit
+    result = page.evaluate(
+        """() => {
+            if (document.forms.length > 0) {
+                try {
+                    document.forms[0].submit();
+                    return 'form.submit() 実行 (forms=' + document.forms.length + ')';
+                } catch (e) {
+                    return 'form.submit() 失敗: ' + e.message;
+                }
+            }
+            return null;
+        }"""
+    )
+    if result:
+        return result
 
-        print(f"[wait] 中継ページ待機中 ({attempt + 1}/4)", flush=True)
+    # 2. onclick付きリンクをクリック
+    result = page.evaluate(
+        """() => {
+            const as = Array.from(document.querySelectorAll('a'));
+            const a = as.find(x => x.onclick || x.getAttribute('onclick'));
+            if (a) { a.click(); return 'onclick付きリンクをクリック'; }
+            if (as.length > 0) { as[0].click(); return '先頭リンクをクリック'; }
+            return 'リンク・フォームなし';
+        }"""
+    )
+    return result or "手立てなし"
 
-        # 自動遷移しない場合に備えてリンクを踏む
+
+def dump_diagnostics(page) -> None:
+    """到達できなかったときに構造を吐き出す。"""
+    print("---- 診断情報 ----", flush=True)
+    print(f"  URL: {page.url}", flush=True)
+    try:
+        info = page.evaluate(
+            """() => {
+                const forms = Array.from(document.forms).map(f => ({
+                    name: f.name, action: f.action, method: f.method,
+                    fields: Array.from(f.elements).map(e => e.name).filter(Boolean)
+                }));
+                const links = Array.from(document.querySelectorAll('a'))
+                    .slice(0, 10)
+                    .map(a => ({ text: (a.innerText || '').trim().slice(0, 30),
+                                 href: a.getAttribute('href'),
+                                 onclick: a.getAttribute('onclick') }));
+                const scripts = Array.from(document.querySelectorAll('script'))
+                    .map(s => (s.innerText || '').trim().slice(0, 300))
+                    .filter(Boolean).slice(0, 3);
+                return { forms, links, scripts };
+            }"""
+        )
+        print("  forms: " + json.dumps(info["forms"], ensure_ascii=False), flush=True)
+        print("  links: " + json.dumps(info["links"], ensure_ascii=False), flush=True)
+        for i, s in enumerate(info["scripts"]):
+            print(f"  script[{i}]: {s}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  診断取得失敗: {exc}", flush=True)
+    print("---- 診断ここまで ----", flush=True)
+
+
+def fetch_text(page) -> tuple[str, bool]:
+    """(正規化済み本文, 結果ページに到達したか) を返す。"""
+    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        page.wait_for_timeout(2500)
+        raw = body_text(page)
+
+        if reached_result(raw) and not is_interstitial(raw):
+            print(f"[ok] 結果ページに到達 (試行 {attempt})", flush=True)
+            return normalize(raw), True
+
+        action = try_advance(page)
+        print(f"[wait] 中継ページ ({attempt}/{MAX_ATTEMPTS}) → {action}", flush=True)
+
         try:
-            link = page.locator("a").first
-            if link.count() > 0:
-                link.click(timeout=5000)
-                page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:  # noqa: BLE001
             pass
 
-    body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
-    return normalize(body)
+    raw = body_text(page)
+    if reached_result(raw) and not is_interstitial(raw):
+        return normalize(raw), True
+
+    dump_diagnostics(page)
+    return normalize(raw), False
 
 
 # ---------------------------------------------------------------------------
@@ -188,20 +258,22 @@ def main() -> int:
         )
         page = context.new_page()
         try:
-            text = fetch_text(page)
+            text, ok = fetch_text(page)
         except Exception as exc:  # noqa: BLE001
             print(f"[ERROR] 取得失敗: {type(exc).__name__}: {exc}", flush=True)
             browser.close()
             return 1
-        finally:
-            pass
         browser.close()
 
-    # 初回チューニング用に取得内容をログへ出す
-    print("---- 取得した本文（先頭 %d 行）----" % LOG_PREVIEW_LINES, flush=True)
+    print(f"---- 取得した本文（先頭 {LOG_PREVIEW_LINES} 行）----", flush=True)
     for ln in text.splitlines()[:LOG_PREVIEW_LINES]:
         print("  " + ln, flush=True)
     print("---- ここまで ----", flush=True)
+
+    # 結果ページに到達できていないなら、あき家の有無は判定しない
+    if not ok:
+        print("[ERROR] 結果ページに到達できませんでした。判定は行いません。", flush=True)
+        return 1
 
     if len(text) < MIN_TEXT_LEN:
         print(f"[ERROR] 本文が{len(text)}文字しか取得できませんでした", flush=True)
@@ -222,7 +294,7 @@ def main() -> int:
         if prev_vacancy is not None and prev_vacancy != vacancy:
             changed = True
             reasons.append(
-                f"あき家判定が変化: {'なし' if prev_vacancy is False else 'あり'}"
+                f"あき家判定が変化: {'あり' if prev_vacancy else 'なし'}"
                 f" → {'あり' if vacancy else 'なし'}"
             )
 
