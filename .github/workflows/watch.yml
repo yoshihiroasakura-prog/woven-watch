@@ -1,0 +1,64 @@
+name: woven-city-watch
+
+on:
+  schedule:
+    # 30分おき（UTC基準。GitHub側の混雑で数分〜数十分ずれます）
+    - cron: "*/30 * * * *"
+  workflow_dispatch:        # 手動実行用
+
+permissions:
+  contents: write           # state/ のコミットに必要
+  issues: write             # 通知Issueの作成に必要
+
+concurrency:
+  group: woven-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-v1
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet playwright
+          playwright install --with-deps chromium
+
+      - name: Run watcher
+        run: python watch.py
+
+      - name: Create issue on change
+        if: hashFiles('ALERT.md') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Woven City 更新検知 $(TZ=Asia/Tokyo date '+%m/%d %H:%M')" \
+            --body-file ALERT.md
+
+      - name: Commit state
+        run: |
+          rm -f ALERT.md
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          if git diff --staged --quiet; then
+            echo "no state change"
+          else
+            git commit -m "state: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+            git pull --rebase --autostash
+            git push
+          fi
