@@ -3,12 +3,17 @@
 Woven City 予約情報 監視スクリプト
 
 公式ページをヘッドレスブラウザでレンダリングし、
-  (a) 注目キーワードの出現・消滅
-  (b) 本文テキスト全体の変化
-を前回実行時の状態と比較する。
+前回実行時の状態と比較する。
 
-変化があれば ALERT.md を書き出して exit 0 で終了する。
-GitHub Actions 側は ALERT.md の有無で通知の要否を判断する。
+設計方針（2026-09 の誤検知を受けて改訂）:
+  このサイトはJavaScript描画のため、実行のたびに取得できる行数が揺れる。
+  「行が減っただけ」の変化は取得漏れの疑いが濃く、告知ではない。
+  9月下旬の告知は必ず文章が増える形で来るので、
+    ・追加行があるとき
+    ・注目キーワードが出現/消滅したとき
+  のみ通知し、削除だけの変化は無視する。
+  さらに、明らかに取得が不完全な回はその結果を保存しない
+  （不完全な内容を基準にすると次回に誤検知が出るため）。
 """
 
 from __future__ import annotations
@@ -32,7 +37,6 @@ TARGETS = [
         "id": "visitors",
         "label": "Visitors（本命：予約方式の案内が出るページ）",
         "url": "https://www.woven-city.global/jpn/people/weavers/visitors/",
-        # このページに現れたら重要度が高い語
         "keywords": [
             "当日現地予約",
             "当日予約",
@@ -76,26 +80,20 @@ TARGETS = [
 STATE_DIR = Path("state")
 ALERT_FILE = Path("ALERT.md")
 
-# ページ読み込み後、JS描画を待つ時間（ミリ秒）
-RENDER_WAIT_MS = 4000
-# 取得した本文がこの文字数未満なら「取得失敗」とみなす
+# JS描画待ち。4秒では足りず取得が揺れたため延長。
+RENDER_WAIT_MS = 8000
 MIN_TEXT_LEN = 300
-# 通知に載せる差分の最大行数
 MAX_DIFF_LINES = 25
+
+# 前回より行数がこの割合を下回ったら「取得が不完全」とみなし保存しない
+TRUNCATION_RATIO = 0.85
 
 JST = timezone(timedelta(hours=9))
 
 
 # ---------------------------------------------------------------------------
-# テキスト正規化
-# ---------------------------------------------------------------------------
 
 def normalize(text: str) -> str:
-    """比較用にテキストを正規化する。
-
-    全角半角の揺れ、連続空白、空行を潰す。
-    日付や数字は意味を持つので残す。
-    """
     text = unicodedata.normalize("NFKC", text)
     lines = []
     for raw in text.splitlines():
@@ -109,8 +107,16 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# 取得
+def added_lines(old: str, new: str) -> list[str]:
+    old_set = set(old.splitlines())
+    return [ln for ln in new.splitlines() if ln not in old_set]
+
+
+def removed_lines(old: str, new: str) -> list[str]:
+    new_set = set(new.splitlines())
+    return [ln for ln in old.splitlines() if ln not in new_set]
+
+
 # ---------------------------------------------------------------------------
 
 def fetch_text(page, url: str) -> str:
@@ -120,32 +126,18 @@ def fetch_text(page, url: str) -> str:
     return normalize(body or "")
 
 
-# ---------------------------------------------------------------------------
-# 差分
-# ---------------------------------------------------------------------------
-
-def line_diff(old: str, new: str) -> list[str]:
-    """追加された行だけを抜き出す（削除は件数のみ報告）。"""
-    old_lines = set(old.splitlines())
-    added = [ln for ln in new.splitlines() if ln not in old_lines]
-    return added
-
-
 def check_target(page, target: dict) -> dict:
-    """1ページ分を確認し、結果 dict を返す。"""
     result = {
         "id": target["id"],
         "label": target["label"],
         "url": target["url"],
-        "ok": False,
-        "changed": False,
+        "notify": False,
         "reasons": [],
-        "added_lines": [],
-        "removed_count": 0,
-        "keywords_now": [],
+        "added": [],
         "keywords_added": [],
         "keywords_removed": [],
         "error": None,
+        "skipped_save": False,
     }
 
     try:
@@ -161,50 +153,67 @@ def check_target(page, target: dict) -> dict:
         )
         return result
 
-    result["ok"] = True
-
     kw_now = sorted({kw for kw in target["keywords"] if kw in text})
-    result["keywords_now"] = kw_now
-
     state_path = STATE_DIR / f"{target['id']}.json"
-    if state_path.exists():
-        prev = json.loads(state_path.read_text(encoding="utf-8"))
-        prev_text = prev.get("text", "")
-        prev_kw = set(prev.get("keywords", []))
 
-        kw_added = sorted(set(kw_now) - prev_kw)
-        kw_removed = sorted(prev_kw - set(kw_now))
-        result["keywords_added"] = kw_added
-        result["keywords_removed"] = kw_removed
-
-        if kw_added:
-            result["changed"] = True
-            result["reasons"].append(f"キーワード出現: {', '.join(kw_added)}")
-        if kw_removed:
-            result["changed"] = True
-            result["reasons"].append(f"キーワード消滅: {', '.join(kw_removed)}")
-
-        if text_hash(prev_text) != text_hash(text):
-            added = line_diff(prev_text, text)
-            removed = line_diff(text, prev_text)
-            result["added_lines"] = added
-            result["removed_count"] = len(removed)
-            if added or removed:
-                result["changed"] = True
-                result["reasons"].append(
-                    f"本文変化: 追加{len(added)}行 / 削除{len(removed)}行"
-                )
-    else:
-        # 初回。基準を作るだけで通知はしない。
+    if not state_path.exists():
         result["reasons"].append("初回取得（基準を保存）")
+        save_state(state_path, target["url"], text, kw_now)
+        return result
 
-    state_path.write_text(
+    prev = json.loads(state_path.read_text(encoding="utf-8"))
+    prev_text = prev.get("text", "")
+    prev_kw = set(prev.get("keywords", []))
+
+    now_lines = len(text.splitlines())
+    prev_lines = len(prev_text.splitlines())
+
+    # 取得が明らかに不完全な回は、比較も保存もしない
+    if prev_lines > 0 and now_lines < prev_lines * TRUNCATION_RATIO:
+        result["skipped_save"] = True
+        result["reasons"].append(
+            f"取得が不完全と判断（{prev_lines}行 → {now_lines}行）。保存も通知もしません。"
+        )
+        return result
+
+    add = added_lines(prev_text, text)
+    rem = removed_lines(prev_text, text)
+
+    kw_added = sorted(set(kw_now) - prev_kw)
+    kw_removed = sorted(prev_kw - set(kw_now))
+    result["keywords_added"] = kw_added
+    result["keywords_removed"] = kw_removed
+
+    if kw_added:
+        result["notify"] = True
+        result["reasons"].append(f"キーワード出現: {', '.join(kw_added)}")
+    if kw_removed:
+        result["notify"] = True
+        result["reasons"].append(f"キーワード消滅: {', '.join(kw_removed)}")
+
+    if add:
+        result["notify"] = True
+        result["added"] = add
+        result["reasons"].append(f"本文に{len(add)}行追加")
+    elif rem:
+        # 削除だけの変化は取得揺れの疑いが濃いので通知しない
+        result["reasons"].append(f"削除のみ{len(rem)}行（通知対象外）")
+
+    if text_hash(prev_text) != text_hash(text):
+        save_state(state_path, target["url"], text, kw_now)
+
+    return result
+
+
+def save_state(path: Path, url: str, text: str, keywords: list[str]) -> None:
+    path.write_text(
         json.dumps(
             {
-                "url": target["url"],
+                "url": url,
                 "fetched_at": datetime.now(JST).isoformat(),
                 "hash": text_hash(text),
-                "keywords": kw_now,
+                "lines": len(text.splitlines()),
+                "keywords": keywords,
                 "text": text,
             },
             ensure_ascii=False,
@@ -213,11 +222,7 @@ def check_target(page, target: dict) -> dict:
         encoding="utf-8",
     )
 
-    return result
 
-
-# ---------------------------------------------------------------------------
-# 通知本文
 # ---------------------------------------------------------------------------
 
 def build_alert(results: list[dict]) -> str:
@@ -225,7 +230,7 @@ def build_alert(results: list[dict]) -> str:
     out = [f"検知時刻: {now}", ""]
 
     for r in results:
-        if not (r["changed"] or r["error"]):
+        if not (r["notify"] or r["error"]):
             continue
 
         out.append(f"## {r['label']}")
@@ -249,14 +254,14 @@ def build_alert(results: list[dict]) -> str:
                 out.append(f"- `{kw}`")
             out.append("")
 
-        if r["added_lines"]:
+        if r["added"]:
             out.append("**追加された本文**")
             out.append("")
             out.append("```")
-            for ln in r["added_lines"][:MAX_DIFF_LINES]:
+            for ln in r["added"][:MAX_DIFF_LINES]:
                 out.append(ln)
-            if len(r["added_lines"]) > MAX_DIFF_LINES:
-                out.append(f"... 他 {len(r['added_lines']) - MAX_DIFF_LINES} 行")
+            if len(r["added"]) > MAX_DIFF_LINES:
+                out.append(f"... 他 {len(r['added']) - MAX_DIFF_LINES} 行")
             out.append("```")
             out.append("")
 
@@ -265,8 +270,6 @@ def build_alert(results: list[dict]) -> str:
     out.append("このIssueは自動生成です。確認したらCloseしてください。")
     return "\n".join(out)
 
-
-# ---------------------------------------------------------------------------
 
 def main() -> int:
     STATE_DIR.mkdir(exist_ok=True)
@@ -288,13 +291,20 @@ def main() -> int:
         for target in TARGETS:
             print(f"[check] {target['id']} {target['url']}", flush=True)
             r = check_target(page, target)
-            status = "ERROR" if r["error"] else ("CHANGED" if r["changed"] else "same")
+            if r["error"]:
+                status = "ERROR"
+            elif r["notify"]:
+                status = "NOTIFY"
+            elif r["skipped_save"]:
+                status = "SKIP"
+            else:
+                status = "same"
             print(f"[{status}] {target['id']} :: {'; '.join(r['reasons']) or '-'}",
                   flush=True)
             results.append(r)
         browser.close()
 
-    notify = [r for r in results if r["changed"] or r["error"]]
+    notify = [r for r in results if r["notify"] or r["error"]]
     if notify:
         ALERT_FILE.write_text(build_alert(results), encoding="utf-8")
         print(f"[alert] {len(notify)}件の通知対象", flush=True)
