@@ -7,13 +7,13 @@ Woven City 予約情報 監視スクリプト
 
 設計方針（2026-09 の誤検知を受けて改訂）:
   このサイトはJavaScript描画のため、実行のたびに取得できる行数が揺れる。
-  「行が減っただけ」の変化は取得漏れの疑いが濃く、告知ではない。
+  特にクッキー同意バナーが出たり消えたりして誤検知の原因になったため、
+  比較前に除去する。
+  また「行が減っただけ」の変化は取得漏れの疑いが濃く、告知ではない。
   9月下旬の告知は必ず文章が増える形で来るので、
     ・追加行があるとき
     ・注目キーワードが出現/消滅したとき
   のみ通知し、削除だけの変化は無視する。
-  さらに、明らかに取得が不完全な回はその結果を保存しない
-  （不完全な内容を基準にすると次回に誤検知が出るため）。
 """
 
 from __future__ import annotations
@@ -88,6 +88,19 @@ MAX_DIFF_LINES = 25
 # 前回より行数がこの割合を下回ったら「取得が不完全」とみなし保存しない
 TRUNCATION_RATIO = 0.85
 
+# クッキー同意バナーなど、読み込みタイミングで出たり消えたりする要素。
+# 告知とは無関係なので比較対象から外す。
+NOISE_PATTERNS = [
+    re.compile(r"website cookies", re.I),
+    re.compile(r"Cookies are used to give you", re.I),
+    re.compile(r"^Show details$", re.I),
+    re.compile(r"^Accept all$", re.I),
+    re.compile(r"^Customize$", re.I),
+    re.compile(r"^Reject all$", re.I),
+    re.compile(r"^クッキー", re.I),
+    re.compile(r"すべて(受け入れる|拒否)"),
+]
+
 JST = timezone(timedelta(hours=9))
 
 
@@ -98,8 +111,11 @@ def normalize(text: str) -> str:
     lines = []
     for raw in text.splitlines():
         line = re.sub(r"[ \t\u3000]+", " ", raw).strip()
-        if line:
-            lines.append(line)
+        if not line:
+            continue
+        if any(p.search(line) for p in NOISE_PATTERNS):
+            continue
+        lines.append(line)
     return "\n".join(lines)
 
 
