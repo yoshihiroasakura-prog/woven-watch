@@ -2,18 +2,23 @@
 """
 Woven City 予約情報 監視スクリプト
 
-公式ページをヘッドレスブラウザでレンダリングし、
-前回実行時の状態と比較する。
+公式ページをレンダリングし、前回実行時と比較して
+「予約に関係のある文章が増えたとき」だけ通知する。
 
-設計方針（2026-09 の誤検知を受けて改訂）:
-  このサイトはJavaScript描画のため、実行のたびに取得できる行数が揺れる。
-  特にクッキー同意バナーとプライバシー設定パネルが出たり消えたりして
-  誤検知の原因になったため、比較前に除去する。
-  また「行が減っただけ」の変化は取得漏れの疑いが濃く、告知ではない。
-  9月下旬の告知は必ず文章が増える形で来るので、
-    ・追加行があるとき
-    ・注目キーワードが出現/消滅したとき
-  のみ通知し、削除だけの変化は無視する。
+■ なぜこの方式か（2026-09 の誤検知3件を受けた設計）
+
+  当初は本文の追加行をそのまま通知していたが、クッキー同意バナーが
+  読み込みタイミングで出たり消えたりして誤検知が続いた。
+  英語版・日本語版・カリフォルニア州向けパネルの3種類が確認され、
+  文言を1つずつ除外していく方式は追いつかないと判断した。
+
+  一方、キーワードの新規出現だけで判定する方式も弱い。
+  「当日現地予約」「10月」は既にページに載っているため、
+  告知が出ても新規出現にならず取り逃がす。
+
+  そこで、追加行のうち「話題語」を含む行だけを通知対象とする。
+  バナー類は予約・受付・訪問といった語を一切含まないため確実に落ち、
+  本物の告知はこれらの語を必ず含むため確実に拾える。
 """
 
 from __future__ import annotations
@@ -32,22 +37,22 @@ from playwright.sync_api import sync_playwright
 # 設定
 # ---------------------------------------------------------------------------
 
+# 追加行がこれらの語を1つでも含めば「意味のある変化」とみなす。
+# バナー・同意パネル・フッター類はこれらを含まない。
+TOPIC_WORDS = [
+    "予約", "受付", "ツアー", "訪問", "ビジター", "入場", "定員",
+    "先着", "申込", "見学", "来場", "募集", "開始", "整理券",
+    "One Day", "Weavers",
+]
+
 TARGETS = [
     {
         "id": "visitors",
         "label": "Visitors（本命：予約方式の案内が出るページ）",
         "url": "https://www.woven-city.global/jpn/people/weavers/visitors/",
         "keywords": [
-            "当日現地予約",
-            "当日予約",
-            "10月1日",
-            "10月",
-            "予約受付",
-            "受付開始",
-            "先着",
-            "定員",
-            "満席",
-            "受付を終了",
+            "当日現地予約", "当日予約", "現地予約", "整理券",
+            "予約方法", "受付開始", "先着", "定員", "満席", "受付を終了",
         ],
     },
     {
@@ -55,12 +60,8 @@ TARGETS = [
         "label": "公式トップ（News欄）",
         "url": "https://www.woven-city.global/jpn/",
         "keywords": [
-            "One Day Weavers",
-            "ビジター",
-            "受付",
-            "予約",
-            "10月",
-            "静岡県在住",
+            "One Day Weavers", "ビジター", "当日現地予約",
+            "受付を開始", "10月", "静岡県在住",
         ],
     },
     {
@@ -68,11 +69,7 @@ TARGETS = [
         "label": "Woven by Toyota ニュースリリース",
         "url": "https://woven.toyota/jp/our-latest/",
         "keywords": [
-            "One Day Weavers",
-            "ビジター",
-            "訪問",
-            "予約",
-            "静岡県",
+            "One Day Weavers", "ビジター", "訪問", "当日現地予約", "静岡県",
         ],
     },
 ]
@@ -80,33 +77,10 @@ TARGETS = [
 STATE_DIR = Path("state")
 ALERT_FILE = Path("ALERT.md")
 
-# JS描画待ち。4秒では足りず取得が揺れたため延長。
 RENDER_WAIT_MS = 8000
 MIN_TEXT_LEN = 300
 MAX_DIFF_LINES = 25
-
-# 前回より行数がこの割合を下回ったら「取得が不完全」とみなし保存しない
 TRUNCATION_RATIO = 0.85
-
-# クッキー同意バナーなど、読み込みタイミングで出たり消えたりする要素。
-# 告知とは無関係なので比較対象から外す。
-NOISE_PATTERNS = [
-    re.compile(r"website cookies", re.I),
-    re.compile(r"Cookies are used to give you", re.I),
-    re.compile(r"^Show details$", re.I),
-    re.compile(r"^Accept all$", re.I),
-    re.compile(r"^Customize$", re.I),
-    re.compile(r"^Reject all$", re.I),
-    re.compile(r"^クッキー", re.I),
-    re.compile(r"すべて(受け入れる|拒否)"),
-    # カリフォルニア州向けプライバシー設定パネル（woven.toyota で確認）
-    re.compile(r"Manage Your Personal Information", re.I),
-    re.compile(r"Do Not Sell or Share My Personal Information", re.I),
-    re.compile(r"You may opt out of the sale or sharing", re.I),
-    re.compile(r"Requests to Opt Out", re.I),
-    re.compile(r"^OK$"),
-    re.compile(r"^Do not sell or share my personal information$", re.I),
-]
 
 JST = timezone(timedelta(hours=9))
 
@@ -118,11 +92,8 @@ def normalize(text: str) -> str:
     lines = []
     for raw in text.splitlines():
         line = re.sub(r"[ \t\u3000]+", " ", raw).strip()
-        if not line:
-            continue
-        if any(p.search(line) for p in NOISE_PATTERNS):
-            continue
-        lines.append(line)
+        if line:
+            lines.append(line)
     return "\n".join(lines)
 
 
@@ -130,14 +101,13 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def is_topical(line: str) -> bool:
+    return any(w in line for w in TOPIC_WORDS)
+
+
 def added_lines(old: str, new: str) -> list[str]:
     old_set = set(old.splitlines())
     return [ln for ln in new.splitlines() if ln not in old_set]
-
-
-def removed_lines(old: str, new: str) -> list[str]:
-    new_set = set(new.splitlines())
-    return [ln for ln in old.splitlines() if ln not in new_set]
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +128,7 @@ def check_target(page, target: dict) -> dict:
         "reasons": [],
         "added": [],
         "keywords_added": [],
-        "keywords_removed": [],
         "error": None,
-        "skipped_save": False,
     }
 
     try:
@@ -188,39 +156,33 @@ def check_target(page, target: dict) -> dict:
     prev_text = prev.get("text", "")
     prev_kw = set(prev.get("keywords", []))
 
-    now_lines = len(text.splitlines())
-    prev_lines = len(prev_text.splitlines())
-
-    # 取得が明らかに不完全な回は、比較も保存もしない
-    if prev_lines > 0 and now_lines < prev_lines * TRUNCATION_RATIO:
-        result["skipped_save"] = True
+    now_n = len(text.splitlines())
+    prev_n = len(prev_text.splitlines())
+    if prev_n > 0 and now_n < prev_n * TRUNCATION_RATIO:
         result["reasons"].append(
-            f"取得が不完全と判断（{prev_lines}行 → {now_lines}行）。保存も通知もしません。"
+            f"取得が不完全と判断（{prev_n}行 → {now_n}行）。保存も通知もしません。"
         )
         return result
 
-    add = added_lines(prev_text, text)
-    rem = removed_lines(prev_text, text)
+    # 追加行のうち、話題語を含むものだけを対象にする
+    all_added = added_lines(prev_text, text)
+    topical = [ln for ln in all_added if is_topical(ln)]
+    ignored = len(all_added) - len(topical)
 
     kw_added = sorted(set(kw_now) - prev_kw)
-    kw_removed = sorted(prev_kw - set(kw_now))
     result["keywords_added"] = kw_added
-    result["keywords_removed"] = kw_removed
 
     if kw_added:
         result["notify"] = True
         result["reasons"].append(f"キーワード出現: {', '.join(kw_added)}")
-    if kw_removed:
-        result["notify"] = True
-        result["reasons"].append(f"キーワード消滅: {', '.join(kw_removed)}")
 
-    if add:
+    if topical:
         result["notify"] = True
-        result["added"] = add
-        result["reasons"].append(f"本文に{len(add)}行追加")
-    elif rem:
-        # 削除だけの変化は取得揺れの疑いが濃いので通知しない
-        result["reasons"].append(f"削除のみ{len(rem)}行（通知対象外）")
+        result["added"] = topical
+        result["reasons"].append(f"予約関連の記述が{len(topical)}行追加")
+
+    if ignored:
+        result["reasons"].append(f"（無関係な変化{ignored}行は無視）")
 
     if text_hash(prev_text) != text_hash(text):
         save_state(state_path, target["url"], text, kw_now)
@@ -278,7 +240,7 @@ def build_alert(results: list[dict]) -> str:
             out.append("")
 
         if r["added"]:
-            out.append("**追加された本文**")
+            out.append("**追加された記述**")
             out.append("")
             out.append("```")
             for ln in r["added"][:MAX_DIFF_LINES]:
@@ -318,8 +280,6 @@ def main() -> int:
                 status = "ERROR"
             elif r["notify"]:
                 status = "NOTIFY"
-            elif r["skipped_save"]:
-                status = "SKIP"
             else:
                 status = "same"
             print(f"[{status}] {target['id']} :: {'; '.join(r['reasons']) or '-'}",
