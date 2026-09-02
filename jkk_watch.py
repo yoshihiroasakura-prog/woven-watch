@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JKK東京 コーシャハイム方南町ガーデンコート あき家監視スクリプト
+JKK東京 コーシャハイム中野弥生町 あき家監視スクリプト
 
 物件専用の直リンクを開き、あき家の有無だけを判定する。
 
@@ -31,15 +31,15 @@ from playwright.sync_api import sync_playwright
 # 設定
 # ---------------------------------------------------------------------------
 
-BUKKEN_NAME = "コーシャハイム方南町ガーデンコート"
+BUKKEN_NAME = "コーシャハイム中野弥生町"
 
 TARGET_URL = (
     "https://jhomes.to-kousya.or.jp/search/jkknet/service/akiyaJyokenDirect"
     "?sen_flg=1"
-    "&jutaku_name=30B330FC30B730E330CF30A430E030DB30A630CA30F330C130E730A630AC30FC30C730F330B330FC30C8"
+    "&jutaku_name=30B330FC30B730E330CF30A430E030CA30AB30CE30E430E830A430C130E730A6"
 )
 
-STATE_FILE = Path("state-jkk/honancho.json")
+STATE_FILE = Path("state-jkk/nakanoyayoicho.json")
 ALERT_FILE = Path("ALERT_JKK.md")
 
 # 「空室なし」を示す文言（実ページで確認済み）
